@@ -12,6 +12,9 @@ const MIN_SAMPLES: usize = RATE * 3 / 10; // 0.3 s
 const PAD_TO: usize = RATE * 11 / 10; // whisper.cpp rejects < 1.0 s
 const SILENCE_RMS: f32 = 0.001;
 const LOW_ENERGY_RMS: f32 = 0.008;
+const AUDIO_CTX_MAX: usize = 1500;
+const AUDIO_CTX_FLOOR: usize = 512;
+const AUDIO_CTX_MARGIN: usize = 100;
 const MAX_PROMPT_WORDS: usize = 50;
 
 pub struct Transcriber {
@@ -52,7 +55,7 @@ impl Transcriber {
         if should_skip(samples_16k.len(), energy) {
             return Ok(String::new());
         }
-        let mut audio = samples_16k.to_vec();
+        let mut audio = crate::audio::trim_silence(samples_16k).to_vec();
         if audio.len() < PAD_TO {
             audio.resize(PAD_TO, 0.0);
         }
@@ -74,6 +77,7 @@ impl Transcriber {
         p.set_suppress_blank(true);
         p.set_suppress_nst(true);
         p.set_initial_prompt(&initial_prompt(vocabulary));
+        p.set_audio_ctx(audio_ctx_for(audio.len()));
 
         state.full(p, &audio).map_err(|e| anyhow!("whisper inference failed: {e:?}"))?;
         let raw: String = state
@@ -84,6 +88,14 @@ impl Transcriber {
         let secs = samples_16k.len() as f32 / RATE as f32;
         Ok(clean_output(&raw, secs, energy))
     }
+}
+
+/// Encoder frames to process (50 per second of audio; 1500 = whisper's full 30 s window).
+/// Measured on large-v3-turbo: a floor of 512 (~10 s) is stable, while <= 256 makes short clips
+/// repeat themselves.
+fn audio_ctx_for(samples: usize) -> i32 {
+    let frames = (samples * 50).div_ceil(RATE) + AUDIO_CTX_MARGIN;
+    frames.clamp(AUDIO_CTX_FLOOR, AUDIO_CTX_MAX) as i32
 }
 
 fn should_skip(len: usize, energy: f32) -> bool {
@@ -224,6 +236,15 @@ mod tests {
     fn transcriber_is_send_sync() {
         fn check<T: Send + Sync>() {}
         check::<Transcriber>();
+    }
+
+    #[test]
+    fn audio_ctx_scales_and_clamps() {
+        assert_eq!(audio_ctx_for(PAD_TO), 512);
+        assert_eq!(audio_ctx_for(RATE * 10), 600);
+        assert_eq!(audio_ctx_for(RATE * 20), 1100);
+        assert_eq!(audio_ctx_for(RATE * 29), 1500);
+        assert_eq!(audio_ctx_for(RATE * 40), 1500);
     }
 
     #[test]

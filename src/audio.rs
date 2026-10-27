@@ -198,6 +198,30 @@ pub fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
+const TRIM_FRAME: usize = 320; // 20 ms at 16 kHz
+const TRIM_MARGIN: usize = 4_000; // 250 ms kept on each side of the speech
+
+/// Strips leading and trailing silence (keeping a 250 ms margin) so whisper has less to encode.
+/// The threshold adapts to the clip: a multiple of its noise floor (10th-percentile frame RMS) and
+/// a fraction of its loudest frame, so mic hiss is treated as silence but quiet words are kept.
+/// Returns the input unchanged when nothing clearly rises above the noise.
+pub fn trim_silence(samples_16k: &[f32]) -> &[f32] {
+    let rms_of: Vec<f32> = samples_16k.chunks(TRIM_FRAME).map(rms).collect();
+    if rms_of.len() < 4 {
+        return samples_16k;
+    }
+    let mut sorted = rms_of.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let floor = sorted[sorted.len() / 10];
+    let peak = sorted[sorted.len() - 1];
+    let threshold = (floor * 3.0).max(peak * 0.02).max(0.002);
+    let Some(first) = rms_of.iter().position(|&r| r > threshold) else { return samples_16k };
+    let last = rms_of.iter().rposition(|&r| r > threshold).unwrap_or(first);
+    let start = (first * TRIM_FRAME).saturating_sub(TRIM_MARGIN);
+    let end = ((last + 1) * TRIM_FRAME + TRIM_MARGIN).min(samples_16k.len());
+    &samples_16k[start..end]
+}
+
 /// Band-limited resampler: Hann-windowed sinc evaluated at each output position.
 /// The cutoff tracks the lower of the two Nyquist rates, so downsampling is anti-aliased.
 pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
@@ -236,6 +260,61 @@ mod tests {
 
     fn sine(freq: f32, rate: u32, secs: f32, amp: f32) -> Vec<f32> {
         (0..(rate as f32 * secs) as usize).map(|i| amp * (2.0 * PI * freq * i as f32 / rate as f32).sin()).collect()
+    }
+
+    fn noise(n: usize, amp: f32, seed: &mut u32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((*seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trim_removes_digital_silence_keeps_margin() {
+        let mut x = vec![0.0; 32_000];
+        x.extend(sine(300.0, 16_000, 1.0, 0.3));
+        x.extend(vec![0.0; 32_000]);
+        let t = trim_silence(&x);
+        assert_eq!(t.len(), 16_000 + 2 * TRIM_MARGIN);
+        assert!(rms(&t[TRIM_MARGIN..TRIM_MARGIN + 16_000]) > 0.15);
+    }
+
+    #[test]
+    fn trim_handles_noise_floor() {
+        let mut seed = 1;
+        let mut x = noise(40_000, 0.01, &mut seed);
+        let speech: Vec<f32> = sine(250.0, 16_000, 1.0, 0.2).iter().zip(noise(16_000, 0.01, &mut seed)).map(|(a, b)| a + b).collect();
+        x.extend(speech);
+        x.extend(noise(40_000, 0.01, &mut seed));
+        let t = trim_silence(&x);
+        assert!(t.len() < 16_000 + 2 * TRIM_MARGIN + 2 * TRIM_FRAME, "len {}", t.len());
+        assert!(t.len() >= 16_000 + 2 * TRIM_MARGIN - 2 * TRIM_FRAME, "len {}", t.len());
+    }
+
+    #[test]
+    fn trim_keeps_quiet_speech_and_inner_pauses() {
+        let mut x = vec![0.0; 16_000];
+        x.extend(sine(200.0, 16_000, 0.5, 0.3));
+        x.extend(vec![0.0; 24_000]); // long inner pause is never cut
+        x.extend(sine(200.0, 16_000, 0.5, 0.01)); // very quiet tail word
+        x.extend(vec![0.0; 16_000]);
+        let t = trim_silence(&x);
+        assert_eq!(t.len(), 8_000 + 24_000 + 8_000 + 2 * TRIM_MARGIN);
+    }
+
+    #[test]
+    fn trim_leaves_silent_and_untrimmable_input_alone() {
+        let silent = vec![0.0; 48_000];
+        assert_eq!(trim_silence(&silent).len(), silent.len());
+        let mut seed = 7;
+        let hiss = noise(48_000, 0.01, &mut seed);
+        assert_eq!(trim_silence(&hiss).len(), hiss.len());
+        let tone = sine(300.0, 16_000, 2.0, 0.3);
+        assert_eq!(trim_silence(&tone).len(), tone.len());
+        assert_eq!(trim_silence(&[]).len(), 0);
+        assert_eq!(trim_silence(&tone[..500]).len(), 500);
     }
 
     #[test]

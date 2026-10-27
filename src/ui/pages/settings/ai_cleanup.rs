@@ -68,7 +68,7 @@ pub fn show(hub: &mut Hub, ui: &mut Ui) {
                     }
                 });
             }
-            g.row("Time limit", "After this, Murmur pastes the locally formatted text instead.", |ui| {
+            g.row("Time limit", "For short dictations; longer ones get more time (up to 3×). After it, Murmur pastes the locally formatted text.", |ui| {
                 ui.spacing_mut().slider_width = 150.0;
                 ui.add(
                     egui::Slider::new(&mut s.llm_timeout_ms, 1000..=8000)

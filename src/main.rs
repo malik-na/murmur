@@ -194,6 +194,14 @@ impl Controller {
 }
 
 /// Local model first, then the chosen cloud provider, inside one time budget. None means paste the local-rules text.
+/// Cleanup time grows ~30 ms per output word, so a flat limit timed out every long dictation.
+/// The configured limit covers dictations up to 20 words; longer ones get 35 ms per extra word,
+/// up to three times the setting.
+fn cleanup_budget(limit_ms: u64, words: u32) -> Duration {
+    let extra = u64::from(words.saturating_sub(20)) * 35;
+    Duration::from_millis((limit_ms + extra).min(limit_ms * 3))
+}
+
 /// Local model first, then the cloud provider, inside one time budget. None means paste the local-rules text.
 /// Actionable cloud failures are reported to `ui` (a toast once per kind, plus the Settings banner).
 fn ai_cleanup(
@@ -205,7 +213,7 @@ fn ai_cleanup(
     ui: Option<&UiShared>,
 ) -> Option<String> {
     let started = Instant::now();
-    let deadline = started + Duration::from_millis(s.llm_timeout_ms);
+    let deadline = started + cleanup_budget(s.llm_timeout_ms, format::word_count(text));
     let remaining = || deadline.saturating_duration_since(Instant::now());
     // A reply far longer than the dictation means the model answered it instead of cleaning it.
     let plausible = |out: &str| out.len() <= text.len() * 2 + 40;
@@ -425,7 +433,9 @@ impl Job {
         let mut text = local.text;
         entry.status = "raw_transcript".into();
 
-        if s.smart_formatting {
+        // Already-clean or very short dictations skip the model: it can't improve them, and it is
+        // most of the latency.
+        if s.smart_formatting && format::needs_ai_cleanup(&raw) {
             if let Some(cleaned) = ai_cleanup(s, &text, category, tone, &vocabulary, Some(&self.shared)) {
                 text = cleaned;
             }
@@ -479,7 +489,63 @@ impl Job {
 }
 
 /// `murmur --transcribe file.wav`: run the dictation pipeline on a mono 16-bit or float WAV and print each stage.
-fn cli_transcribe(path: &str) -> anyhow::Result<()> {
+/// `murmur --bench <dir>`: runs every WAV in `dir` through the real pipeline with the saved
+/// settings and prints per-stage timings, plus how long cleanup takes with no time limit.
+fn cli_bench(dir: &str) -> anyhow::Result<()> {
+    let settings = storage::load_settings();
+    let transcriber = Transcriber::load(&data_dir().join("models").join(&settings.model_file))?;
+    transcriber.warm_up()?;
+    if settings.use_local_llm {
+        let _ = format::local_llm_ping(&settings.local_llm_url, &settings.local_llm_model);
+    }
+    let mut files: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+        .collect();
+    files.sort();
+    let mut unlimited = settings.clone();
+    unlimited.llm_timeout_ms = 30_000;
+    unlimited.use_llm_cleanup = false;
+    println!("{:<22}{:>6}{:>8}{:>9}{:>10}{:>11}{:>8}  result", "file", "audio", "asr", "cleanup", "uncapped", "total", "words");
+    let (mut sum_total, mut sum_unc) = (0u128, 0u128);
+    for f in files {
+        let audio = read_wav(f.to_str().unwrap_or_default())?;
+        let t0 = Instant::now();
+        let raw = transcriber.transcribe(&audio, &settings.language, &[])?;
+        let asr = t0.elapsed().as_millis();
+        let tone = settings.tone_for(StyleCategory::Other);
+        let local = format::format_local(&FormatInput { raw: &raw, dictionary: &[], category: StyleCategory::Other, tone, smart: true });
+        let t1 = Instant::now();
+        let needed = format::needs_ai_cleanup(&raw);
+        let cleaned = if needed { ai_cleanup(&settings, &local.text, StyleCategory::Other, tone, &[], None) } else { None };
+        let cleanup = t1.elapsed().as_millis();
+        let t2 = Instant::now();
+        let _ = ai_cleanup(&unlimited, &local.text, StyleCategory::Other, tone, &[], None);
+        let unc = t2.elapsed().as_millis();
+        sum_total += asr + cleanup;
+        sum_unc += unc;
+        println!(
+            "{:<22}{:>5.1}s{:>6}ms{:>7}ms{:>8}ms{:>9}ms{:>8}  {}",
+            f.file_name().unwrap_or_default().to_string_lossy(),
+            audio.len() as f32 / 16_000.0,
+            asr,
+            cleanup,
+            unc,
+            asr + cleanup,
+            format::word_count(&local.text),
+            match (needed, cleaned.is_some()) {
+                (false, _) => "skipped (already clean)",
+                (true, true) => "AI cleaned",
+                (true, false) => "TIMEOUT -> local rules",
+            }
+        );
+    }
+    println!("sum of totals: {sum_total} ms · sum of uncapped cleanup: {sum_unc} ms");
+    Ok(())
+}
+
+/// Mono 16 kHz samples from a 16-bit PCM or float WAV file (for the CLI tools).
+fn read_wav(path: &str) -> anyhow::Result<Vec<f32>> {
     let bytes = std::fs::read(path)?;
     anyhow::ensure!(bytes.len() > 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE", "not a WAV file");
     let (mut pos, mut format, mut rate, mut bits, mut channels) = (12, 0u16, 0u32, 0u16, 1u16);
@@ -507,7 +573,11 @@ fn cli_transcribe(path: &str) -> anyhow::Result<()> {
         pos += 8 + len + (len & 1);
     }
     let mono: Vec<f32> = samples.chunks(channels as usize).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect();
-    let audio = audio::resample(&mono, rate, 16_000);
+    Ok(audio::resample(&mono, rate, 16_000))
+}
+
+fn cli_transcribe(path: &str) -> anyhow::Result<()> {
+    let audio = read_wav(path)?;
 
     let settings = storage::load_settings();
     let model = data_dir().join("models").join(&settings.model_file);
@@ -538,6 +608,11 @@ fn cli_transcribe(path: &str) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("murmur=info")).init();
     let args: Vec<String> = std::env::args().collect();
+    if let [_, flag, dir] = args.as_slice() {
+        if flag == "--bench" {
+            return cli_bench(dir);
+        }
+    }
     if args.get(1).map(String::as_str) == Some("--cloud-check") {
         // Run the configured cloud provider directly (local model skipped). Never prints credentials.
         let mut s = storage::load_settings();
@@ -641,4 +716,17 @@ fn main() -> anyhow::Result<()> {
 
     ui::run_ui(shared, db, settings, tx)?;
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_budget_scales_with_length() {
+        assert_eq!(cleanup_budget(3000, 4), Duration::from_millis(3000));
+        assert_eq!(cleanup_budget(3000, 20), Duration::from_millis(3000));
+        assert_eq!(cleanup_budget(3000, 111), Duration::from_millis(6185));
+        assert_eq!(cleanup_budget(3000, 1000), Duration::from_millis(9000));
+    }
 }
